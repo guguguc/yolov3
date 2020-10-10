@@ -1,3 +1,4 @@
+import time
 import logging
 
 import tensorflow as tf
@@ -7,23 +8,19 @@ from functools import partial
 
 from tensorflow import keras
 
-from utils.bbox import calc_iou_vectorition_xywh, calc_iou_vectorition_wh, calc_iou_vectorition_wh_np
+from utils.bbox import calc_iou_vectorition_xywh, calc_iou_vectorition_wh
 from utils.util import filter_duplicate
 from config.config import *
 
 np.set_printoptions(precision=4, suppress=True)
 
 
-# tf.debugging.set_log_device_placement(True)
-
 class BatchNormlization(keras.layers.BatchNormalization):
-    """
-    make set trainable False is not to run in infer mode
-    """
+    """make set trainable False is not to run in infer mode """
 
     def call(self, inputs, training=False):
         if not training:
-            traininginputs_shape = tf.constant(False)
+            self.trainable = tf.constant(False)
         training = tf.logical_and(training, self.trainable)
         return super(BatchNormlization, self).call(inputs, training)
 
@@ -38,16 +35,17 @@ class Conv(keras.layers.Layer):
                  bn=False,
                  name=None):
         super(Conv, self).__init__(name=name)
-        initializer = keras.initializers.random_normal(stddev=0.01)
+        initializer = keras.initializers.random_normal(mean=0., stddev=0.02)
         self.conv = keras.layers.Conv2D(filters,
                                         kernel_size,
                                         strides,
                                         padding=padding,
                                         use_bias=not bn,
                                         kernel_initializer=initializer,
-                                        kernel_regularizer=keras.regularizers.l2(5e-3))
+                                        kernel_regularizer=keras.regularizers.l2(5e-4))
         if bn:
-            self.batchnorm = keras.layers.BatchNormalization()
+            self.batchnorm = keras.layers.BatchNormalization(momentum=0.9,
+                                                             epsilon=1e-5)
         self.bn = bn
         if activation == 'leaky':
             self.activation = partial(keras.activations.relu, alpha=0.1)
@@ -113,22 +111,21 @@ class Aggregator(keras.layers.Layer):
 
 
 class YoloHead(keras.layers.Layer):
-    def __init__(self, anchors, name=None):
+    def __init__(self, anchors, grid_size, name=None):
         super(YoloHead, self).__init__(name=name)
         self.anchors = anchors
+        self.grid_size = grid_size
+        shape = (grid_size, grid_size, 3, 4 + 1 + CLASS_NUM)
+        self.reshape_layer = tf.keras.layers.Reshape(shape)
 
     def call(self, inputs, **kwargs):
-        inputs_shape = tf.shape(inputs)
-        batch_size = inputs_shape[0]
-        grid_size = inputs_shape[1]
-        prediction = tf.reshape(
-            inputs, (batch_size, grid_size, grid_size, 3, 4 + 1 + CLASS_NUM))
+        prediction = self.reshape_layer(inputs)
         raw_xy = tf.nn.sigmoid(prediction[..., 0:2])
         raw_wh = prediction[..., 2:4]
         pred_conf = tf.nn.sigmoid(prediction[..., 4:5])
         pred_cls = tf.nn.sigmoid(prediction[..., 5:])
         prediction = tf.concat([raw_xy, raw_wh, pred_conf, pred_cls], axis=-1)
-        prediction = encode_outputs(prediction, grid_size, self.anchors)
+        prediction = encode_outputs(prediction, self.grid_size, self.anchors)
         return prediction
 
 
@@ -152,7 +149,8 @@ def decode_outputs(inputs, grid_size, anchors):
     grid_size = tf.cast(grid_size, tf.float32)
     anchors = tf.reshape(anchors, [1, 1, 1, -1, 2])
     raw_xy = pred_xy * grid_size - grid_xy
-    raw_wh = tf.math.log(pred_wh / anchors + 1e-16)
+    raw_wh = tf.clip_by_value(pred_wh / anchors, 1e-9, 1e9)
+    raw_wh = tf.math.log(raw_wh)
     outputs = tf.concat([raw_xy, raw_wh, pred_conf, pred_cls], axis=-1)
     return outputs
 
@@ -166,7 +164,8 @@ class YOLOLoss:
                  img_dim=416,
                  params=None):
         self.img_dim = tf.convert_to_tensor(img_dim, dtype=tf.float32)
-        self.anchors = tf.cast(tf.truediv(anchors, img_dim), tf.float32)
+        self.anchors = tf.convert_to_tensor(anchors, dtype=tf.float32)
+        self.anchors = tf.divide(self.anchors, self.img_dim)
         self.anchors = tf.reshape(self.anchors, [-1, 2])
         self.mask = mask
         self.match_anchors = tf.gather(self.anchors, indices=mask)
@@ -178,12 +177,11 @@ class YOLOLoss:
         self.sparse_loss = tf.losses.sparse_categorical_crossentropy
         self.l1_smooth_loss = tf.losses.huber
 
-        self.obj_scale = 1
-        self.noobj_scale = 100
-        self.metric = dict()
+        self.obj_scale = 1.0
+        self.noobj_scale = 1.0
 
         params = params if params else dict()
-        self.ignore_thresh = params.pop('ignore_thresh', 0.7)
+        self.ignore_thresh = params.pop('ignore_thresh', 0.5)
         self.truth_thresh = params.pop('truth_thresh', 1.)
         # [iou, mse, giou, diou, ciou]
         self.iou_loss = params.pop('iou_loss', 'iou')
@@ -200,23 +198,89 @@ class YOLOLoss:
         self.grid_size = tf.convert_to_tensor(grid_size, tf.float32)
         self.grid_xy = None
         self.stride = None
-        self.init_grid_param()
-
+        self.metrics = None
+        self.metrics_dict = None
         self.logger = logging.getLogger(f'main.yolo-{self.grid_size}')
+        self.counter = 0
+        self.init_metric()
+        self.init_grid_param()
 
     def init_grid_param(self):
         grid_xy = tf.meshgrid(tf.range(self.grid_size), tf.range(self.grid_size))
-        self.grid_xy = tf.cast(tf.expand_dims(tf.stack(grid_xy, axis=-1), axis=2), tf.float32)
-        self.grid_size = tf.cast(self.grid_size, tf.float32)
+        self.grid_xy = tf.cast(tf.expand_dims(tf.stack(grid_xy, axis=-1), axis=2),
+                               tf.float32)
         self.stride = self.img_dim / self.grid_size
-        self.stride = tf.truediv(self.img_dim, self.grid_size)
 
-    def deocode_gt_box(self, box, indices):
+    def init_metric(self):
+        self.metrics = [
+            'id',
+            'loss box',
+            'loss obj',
+            'loss noobj',
+            'loss cls',
+            'cls  accu',
+            'avg  iou',
+            'avg  obj',
+            'avg  ignore',
+            'total grid'
+        ]
+        self.metrics_dict = {metric: 0. for metric in self.metrics}
+        self.metrics_dict.update(id=self.grid_size.numpy())
+        self.exclude = ['id']
+
+    def update_metric(self, *args):
+        for metric, v in zip(self.metrics[1:], args):
+            self.metrics_dict[metric] += v
+        self.counter += 1
+
+    def reset_metric(self):
+        for m in self.metrics[1:]:
+            self.metrics_dict[m] = 0
+        self.counter = 0
+
+    def get_metric(self):
+        for m in self.metrics:
+            num = 1 if m in self.exclude else self.counter
+            self.metrics_dict[m] /= num
+        return self.metrics_dict
+
+    def bbox_giou(self, boxes1, boxes2):
+
+        boxes1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
+                            boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis=-1)
+        boxes2 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
+                            boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis=-1)
+
+        boxes1 = tf.concat([tf.minimum(boxes1[..., :2], boxes1[..., 2:]),
+                            tf.maximum(boxes1[..., :2], boxes1[..., 2:])], axis=-1)
+        boxes2 = tf.concat([tf.minimum(boxes2[..., :2], boxes2[..., 2:]),
+                            tf.maximum(boxes2[..., :2], boxes2[..., 2:])], axis=-1)
+
+        boxes1_area = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
+        boxes2_area = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
+
+        left_up = tf.maximum(boxes1[..., :2], boxes2[..., :2])
+        right_down = tf.minimum(boxes1[..., 2:], boxes2[..., 2:])
+
+        inter_section = tf.maximum(right_down - left_up, 0.0)
+        inter_area = inter_section[..., 0] * inter_section[..., 1]
+        union_area = boxes1_area + boxes2_area - inter_area
+        iou = inter_area / union_area
+
+        enclose_left_up = tf.minimum(boxes1[..., :2], boxes2[..., :2])
+        enclose_right_down = tf.maximum(boxes1[..., 2:], boxes2[..., 2:])
+        enclose = tf.maximum(enclose_right_down - enclose_left_up, 0.0)
+        enclose_area = enclose[..., 0] * enclose[..., 1]
+        giou = iou - 1.0 * (enclose_area - union_area) / enclose_area
+
+        return giou
+
+    def decode_gt_box(self, box, indices):
         # 相对于一个网格的偏移(0-1)
-        box = tf.gather_nd(box, indices[..., :2])
         anchors = tf.gather(self.match_anchors, indices[..., 2])
         xy = box[..., :2] * self.grid_size - tf.floor(box[..., :2] * self.grid_size)
-        wh = tf.math.log(box[..., 2:] / anchors + 1e-16)
+        wh = tf.clip_by_value(box[..., 2:] / anchors, 1e-9, 1e9)
+        wh = tf.math.log(wh)
         box = tf.concat([xy, wh], -1)
         return box
 
@@ -228,15 +292,17 @@ class YOLOLoss:
                                  anchors=self.match_anchors)[..., :4]
 
         # t1 = time.perf_counter()
-        obj_mask, noobj_mask, cls_mask, bnyxc = self.build_target(pred_box, y_true)
+        obj_mask, noobj_mask, ignore_mask, cls_mask, bnyxc = self.build_target(pred_box, y_true)
         obj_count = tf.reduce_sum(tf.cast(obj_mask, tf.int32))
         noobj_count = tf.reduce_sum(tf.cast(noobj_mask, tf.int32))
         # t2 = time.perf_counter()
-        # print('function build_target const {int((t2-t1)*1000)} ms')
+        # tf.print(f'function build_target const {int((t2-t1)*1000)} ms')
 
         # 将gt box的值解码为pred raw的值
         bnc = tf.concat([bnyxc[..., :2], bnyxc[..., 4:5]], axis=-1)
-        gt_box = self.deocode_gt_box(gt_box, bnc)
+        box = tf.gather_nd(gt_box, bnc[..., :2])
+        gt_box = self.decode_gt_box(box, bnc)
+        truth_xy, truth_wh = tf.split(gt_box, 2, axis=-1)
 
         pos_obj = tf.boolean_mask(pred_conf, mask=obj_mask)
         neg_obj = tf.boolean_mask(pred_conf, mask=noobj_mask)
@@ -245,39 +311,42 @@ class YOLOLoss:
         pos_wh = tf.boolean_mask(raw_box[..., 2:], mask=obj_mask)
         val_pred_cls = tf.boolean_mask(pred_cls, obj_mask)
 
-        loss_obj = 1.0 * self.bce_loss(y_pred=pos_obj,
-                                       y_true=tf.ones(shape=[obj_count, 1], dtype=tf.float32),
-                                       from_logits=False)
+        loss_obj = self.obj_scale * self.bce_loss(y_pred=pos_obj,
+                                                  y_true=tf.ones_like(pos_obj))
 
-        loss_noobj = 1.0 * self.bce_loss(y_pred=neg_obj,
-                                         y_true=tf.zeros(shape=[noobj_count, 1], dtype=tf.float32),
-                                         from_logits=False)
+        loss_noobj = self.noobj_scale * self.bce_loss(y_pred=neg_obj,
+                                                      y_true=tf.zeros_like(neg_obj))
         loss_cls = self.sparse_loss(y_pred=val_pred_cls, y_true=cls_mask)
-        loss_xy = 1.0 * self.bce_loss(y_pred=pos_xy, y_true=gt_box[..., :2])
-        loss_wh = 2.0 * self.l1_smooth_loss(y_pred=pos_wh, y_true=gt_box[..., 2:])
+        loss_box_scale = 2.0 - box[..., 2] * box[..., 3]
+        # loss_xy = loss_box_scale * self.mse_loss(y_pred=pos_xy, y_true=truth_xy)
+        # loss_wh = loss_box_scale * self.mse_loss(y_pred=pos_wh, y_true=truth_wh)
+        giou = self.bbox_giou(tf.boolean_mask(pred_box, obj_mask), box)
+        giou = tf.expand_dims(giou, axis=-1)
+        loss_box = loss_box_scale * (1 - giou) * self.iou_normalizer
 
         # show info
+        total_count = tf.cast(tf.reduce_prod(tf.shape(pred_conf)), tf.float32)
         obj_count = tf.cast(obj_count, tf.float32)
         noobj_count = tf.cast(noobj_count, tf.float32)
+        ignore_count = total_count - obj_count - noobj_count
+        truth_pred_box = tf.boolean_mask(pred_box, obj_mask)
         cls_accu_mask = tf.argmax(val_pred_cls, -1, tf.int32) == cls_mask
+        iou = calc_iou_vectorition_xywh(truth_pred_box, box)
         cls_accu = tf.reduce_mean(tf.cast(cls_accu_mask, tf.float32)) * 100.
-        grid_pobj = tf.reduce_sum(tf.boolean_mask(pred_conf, obj_mask)) / obj_count
-        grid_pnoobj = tf.reduce_sum(tf.boolean_mask(pred_conf, noobj_mask)) / noobj_count
-        grid_pxy = tf.reduce_sum(self.mse_loss(y_pred=pos_xy, y_true=gt_box[..., :2])) / obj_count
-        grid_pwh = tf.reduce_sum(self.mse_loss(y_pred=pos_wh, y_true=gt_box[..., 2:])) / obj_count
-        self.logger.debug(f'\ntotal obj   count {obj_count}'
-                          f'\ngrid  obj   prob {grid_pobj}'
-                          f'\ngrid  noobj prob {grid_pnoobj}'
-                          f'\ngrid  xy    prob {grid_pxy}'
-                          f'\ngrid  wh    prob {grid_pwh}'
-                          f'\ngrdi  cls   accu {cls_accu}')
+        mean_iou = tf.reduce_mean(iou)
 
-        loss_obj = tf.reduce_sum(loss_obj) / obj_count
-        loss_noobj = 100.0 * tf.reduce_sum(loss_noobj) / noobj_count
-        loss_cls = tf.reduce_sum(loss_cls) / obj_count
-        loss_wh = tf.reduce_sum(loss_wh) / obj_count
-        loss_xy = tf.reduce_sum(loss_xy) / obj_count
-        loss_box = (loss_wh + loss_xy)
+        batch_size = tf.cast(tf.shape(y_pred)[0], tf.float32)
+        loss_obj = tf.reduce_sum(loss_obj) / batch_size
+        loss_noobj = tf.reduce_sum(loss_noobj) / batch_size
+        loss_cls = tf.reduce_sum(loss_cls) / batch_size
+        # loss_wh = tf.reduce_sum(loss_wh) / batch_size
+        # loss_xy = tf.reduce_sum(loss_xy) / batch_size
+        # loss_box = (loss_wh + loss_xy)
+        loss_box = tf.reduce_sum(loss_box) / batch_size
+        # self.update_metric(loss_box,
+        #                    loss_obj, loss_noobj, loss_cls,
+        #                    cls_accu, mean_iou, obj_count,
+        #                    ignore_count, total_count)
         return loss_box, loss_obj, loss_noobj, loss_cls
 
     def build_target(self, pred_box, label):
@@ -285,7 +354,7 @@ class YOLOLoss:
         :param pred_box: Tensor of shape (batch, grid_size, grid_size, num_scale, 4)
         :param label: Tensor of shape (batch, num_label, 4 + 1)
         :return obj_mask: Tensor of shape (batch, g, g, num of scale), tf.bool type
-        :return noobj_mask: Tensor represemt background grid with the shame shape and type of obj_mask
+        :return noobj_mask: Tensor mask represemt background grid
         """
         shape = tf.shape(pred_box)
         b, g, s = shape[0], shape[1], shape[3]
@@ -307,10 +376,6 @@ class YOLOLoss:
         # 最匹配且不为空box
         match_mask = tf.logical_and(nonzerobox_mask, anchor_match_mask)
         iou_best = tf.boolean_mask(iou_best, match_mask)
-        # iou_best = tf.logical_and(iou_best, nonzerobox)
-        # 不是最佳但是超过阈值，将一个gt分配到多个同一格点的anchor中
-        # iou_extra = iou > self.iou_thresh
-        # iou_match = tf.logical_or(iou_best, iou_extra)
         grid_yx = tf.boolean_mask(gt_box[..., :2][..., ::-1], match_mask) * (tf.cast(g, tf.float32))
         grid_yx = tf.cast(tf.floor(grid_yx), tf.int32)
         n = iou_best[..., 1:2]
@@ -322,14 +387,13 @@ class YOLOLoss:
         obj_mask = tf.scatter_nd(indices=byxs, updates=tf.ones(tf.shape(byxs)[0], tf.bool),
                                  shape=[b, g, g, s])
         cls_mask = tf.scatter_nd(indices=byxs, updates=tf.squeeze(cls_onethot, axis=-1),
-                                 shape=tf.shape(obj_mask))
+                                 shape=[b, g, g, s])
 
         # 16 13 13 3
-        # boxes = tf.scatter_nd(indices=byxs, updates=gt_box, shape=[b, g, g, s, 4])
-        # iou = calc_iou_vectorition_xywh(pred_box, boxes)
-        iou = self.caculate_iou_in_batch(pred_box, gt_box, match_mask)
-        self.ignore_thresh = 0.5
-        ignore_mask = iou > self.ignore_thresh
+        # t1 = time.perf_counter()
+        ignore_mask = self.caculate_ignore_mask(pred_box, gt_box, nonzerobox_mask)
+        # t2 = time.perf_counter()
+        # tf.print(f'function caculate const {int((t2-t1)*1000)} ms')
         # 除去最佳匹配的
         noobj_mask = tf.logical_not(tf.logical_or(ignore_mask, obj_mask))
         bnyxsc = tf.gather(indices=[0, 4, 1, 2, 3, 5],
@@ -337,25 +401,25 @@ class YOLOLoss:
                            axis=-1)
         return obj_mask, noobj_mask, ignore_mask, cls_mask, bnyxsc
 
-    def caculate_iou_in_batch(self, pred_box, gt_box, val_mask):
+    def caculate_ignore_mask(self, pred_box, gt_box, val_mask):
         """计算每个batch中所有预测格点与gt的IOU"""
+        b = tf.shape(pred_box)[0]
+        ignore_mask = tf.TensorArray(tf.bool, size=0, dynamic_size=True)
 
-        def func(box1, box2):
-            box1 = tf.expand_dims(box1, axis=-2)
-            box2 = tf.expand_dims(box2, axis=0)
-            shape = tf.broadcast_dynamic_shape(tf.shape(box1), tf.shape(box2))
-            box1 = tf.broadcast_to(box1, shape)
-            box2 = tf.broadcast_to(box2, shape)
-            return calc_iou_vectorition_xywh(box1, box2)
+        def loop_cond(idx, ignore_mask):
+            return tf.less(idx, b)
 
-        # 计算所有gt与所有预测框的iou
-        # bach size 20 4 and bach size 13 13 3 4
-        # 1 20 4  13 13 3 1 4
-        # 13 13 3 1 4 and 1 20 4
-        # 13 13 3
-        ious = tf.map_fn(fn=lambda x: tf.reduce_max(func(x[0], tf.boolean_mask(x[1], x[2])),
-                                                    axis=-1),
-                         elems=[pred_box, gt_box, val_mask],
-                         fn_output_signature=tf.TensorSpec(
-                             shape=[None, None, 3], dtype=tf.float32))
-        return ious
+        def loop_body(idx, ignore_mask):
+            true_box = tf.boolean_mask(gt_box[idx], val_mask[idx])
+            iou = calc_iou_vectorition_xywh(tf.expand_dims(pred_box[idx], axis=-2),
+                                            tf.expand_dims(true_box, axis=0))
+            best_iou = tf.reduce_max(iou, axis=-1)
+            mask = best_iou > self.ignore_thresh
+            ignore_mask = ignore_mask.write(idx, mask)
+            return idx + 1, ignore_mask
+
+        _, ignore_mask = tf.while_loop(cond=loop_cond,
+                                       body=loop_body,
+                                       loop_vars=[0, ignore_mask],
+                                       name='calc_ignore_mask')
+        return ignore_mask.stack()

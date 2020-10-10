@@ -69,7 +69,7 @@ def calc_iou_vectorition_xywh(boxes_1, boxes_2):
     intersection = tf.maximum(right_down - left_up, 0)
     intersection = intersection[..., 0] * intersection[..., 1]
     union = boxes_1_area + boxes_2_area - intersection
-    iou = tf.math.divide_no_nan(intersection, union)
+    iou = intersection / union
     return iou
 
 
@@ -133,8 +133,8 @@ def xywh2xyxy_np(boxes):
 def nms_gpu_v2(prediction,
                iou_threshold=0.5,
                score_threshold=0.005,
-               max_size_total=500,
-               max_size_per_class=50):
+               max_size_total=1000,
+               max_size_per_class=500):
     """
     :param prediction: [batchsize, N, 4 + 1 + num_class]
     :param iou_threshold: 超过此阈值的预测边界框被抑制
@@ -269,9 +269,8 @@ def py_nms(pred_boxes,
         # 分数高，添加到keep indices
         idx = descend_indices[0]
         keep_indices.append(idx)
-        ious = calc_iou_vectorition(pred_boxes[idx],
-                                    pred_boxes[descend_indices[1:]],
-                                    xywh=False)
+        ious = calc_iou_vectorition_xyxy(pred_boxes[idx],
+                                         pred_boxes[descend_indices[1:]])
         # 保留的索引
         remeain = np.where(ious <= iou_threshold)[0]
         # 除去descend_indices中第一个，剩余的
@@ -285,7 +284,7 @@ def correct_box(boxes, width, height, out_size=416):
     :param boxes: Tensor of shape [N, 4] letter box normalized coord
     :param width: Tensor of shape [N]
     :param height: Tensor of shape [N]
-    :param out_size: letterbox输出尺寸
+    :param out_size: letterbox变换后的图像尺寸
     :return: boxes: Tensor of shape [N, 4] absolute coord
     """
     ratio = np.minimum(out_size / width, out_size / height)

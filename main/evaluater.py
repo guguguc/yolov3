@@ -38,10 +38,13 @@ class Evaluater:
         gt_columns = ['img_id', 'xmin', 'ymin', 'xmax', 'ymax', 'cls']
         pred_columns = gt_columns + ['score']
         # 评估结果的Dataframe字段
-        metric_colums = ['TP', 'FP', 'TP+FP', 'TP+FN', 'Precision', 'Recall', 'Ap', 'F1 score']
+        metric_colums = ['TP', 'FP', 'TP+FP', 'TP+FN',
+                         'Precision', 'Recall',
+                         'Ap', 'F1 score']
         self.box_filed = ['xmin', 'ymin', 'xmax', 'ymax']
         self.metric_matrix = pd.DataFrame(columns=metric_colums,
-                                          index=pd.Index(class_name, name='category'))
+                                          index=pd.Index(class_name,
+                                                         name='category'))
         self.gt = None
         self.pred = None
         self.logger = logging.getLogger(__name__)
@@ -119,16 +122,19 @@ class Evaluater:
         self.logger.info('ground truth num is %d, predication num is %d',
                          len(self.gt.index), len(self.pred.index))
         # 将pred中相同img_id内部的分数从大到小排序
-        self.pred = self.pred.sort_values(by=['img_id', 'score'], ascending=[True, False], ignore_index=True)
+        self.pred = self.pred.sort_values(by=['img_id', 'score'],
+                                          ascending=[True, False],
+                                          ignore_index=True)
         self.pred = self.pred.groupby('img_id').head(self.max_det).reset_index(drop=True)
         self.gt = self.gt.sort_values(by=['img_id'], ignore_index=True)
         self.gt['id'] = list(self.gt.index)
         self.pred['id'] = list(self.pred.index)
 
     def _set_metric_matrix(self, info: pd.DataFrame, label: pd.DataFrame):
-        print(info.groupby('cls').sum().to_numpy())
-        print(self.metric_matrix[['TP', 'FP']])
-        self.metric_matrix[['TP', 'FP']] = info.groupby('cls').sum().to_numpy()
+        statistic = info.groupby('cls').sum()
+        statistic = statistic.reindex([i for i in range(self.class_num)], fill_value=0)
+        field = ['TP', 'FP', 'FP[iou unmatch]', 'FP[cls unmatch]']
+        self.metric_matrix[field] = statistic.to_numpy()
         self.metric_matrix['TP+FN'] = np.bincount(label['cls'])
         self.metric_matrix['TP+FP'] = self.metric_matrix['TP'] + self.metric_matrix['FP']
         self.metric_matrix['Precision'] = self.metric_matrix['TP'] / self.metric_matrix['TP+FP']
@@ -152,37 +158,51 @@ class Evaluater:
         combined_info['ymin_inter'] = combined_info[['ymin_pred', 'ymin_gt']].max(1)
         combined_info['xmax_inter'] = combined_info[['xmax_pred', 'xmax_gt']].min(1)
         combined_info['ymax_inter'] = combined_info[['ymax_pred', 'ymax_gt']].min(1)
-        inter_area = calc_area_pd(combined_info, ['xmin_inter', 'ymin_inter', 'xmax_inter', 'ymax_inter'])
-        pred_area = calc_area_pd(combined_info, ['xmin_pred', 'ymin_pred', 'xmax_pred', 'ymax_pred'])
-        gt_area = calc_area_pd(combined_info, ['xmin_gt', 'ymin_gt', 'xmax_gt', 'ymax_gt'])
+        inter_area = calc_area_pd(combined_info, ['xmin_inter', 'ymin_inter',
+                                                  'xmax_inter', 'ymax_inter'])
+        pred_area = calc_area_pd(combined_info, ['xmin_pred', 'ymin_pred',
+                                                 'xmax_pred', 'ymax_pred'])
+        gt_area = calc_area_pd(combined_info, ['xmin_gt', 'ymin_gt',
+                                               'xmax_gt', 'ymax_gt'])
         combined_info['iou'] = inter_area / (pred_area + gt_area - inter_area)
-        #assert (combined_info['iou'] >= 0).all()
+        assert (combined_info['iou'] >= 0).all()
         assert (combined_info['iou'] <= 1).all()
         combined_info = combined_info.sort_values(by='iou').groupby('id_pred', as_index=False).last()
         unique_mask = ~combined_info.duplicated(subset='id_gt', keep='first')
+        # 类别预测正确并且最大IOU大于阈值
         match_mask = combined_info['iou'] > self.iou_threshold
-        combined_info['tp'] = unique_mask & match_mask
+        # 类别预测正确但是最大IOU小于阈值
+        iou_unmatch_fp_mask = unique_mask & ~match_mask
+        tp_mask = unique_mask & match_mask
+        # combined_info['tp'] = unique_mask & match_mask
         # 超过类别概率超过分数阈值的pred
-        pred[['tp', 'fp']] = [False, True]
-        tp_index = combined_info['id_pred'][combined_info['tp']]
+        pred[['tp', 'fp', 'fp[iou]', 'fp[cls]']] = [False, True, False, False]
+        tp_index = combined_info['id_pred'][tp_mask]
+        iou_unmatch_fp_index = combined_info['id_pred'][iou_unmatch_fp_mask]
         tp_mask = pred['id'].isin(tp_index)
+        iou_unmatch_fp_mask = pred['id'].isin(iou_unmatch_fp_index)
+        cls_unmatch_fp_mask = ~tp_mask & ~iou_unmatch_fp_mask
         pred.loc[tp_mask, 'tp'] = True
         pred.loc[tp_mask, 'fp'] = False
-        thresh_pred = pred.query(f'score>{self.score_threshold}')[['tp', 'fp', 'cls']]
+        pred.loc[iou_unmatch_fp_mask, 'fp[iou]'] = True
+        pred.loc[cls_unmatch_fp_mask, 'fp[cls]'] = True
+        thresh_pred = pred.query(f'score>{self.score_threshold}')[['tp', 'fp',
+                                                                   'fp[iou]',
+                                                                   'fp[cls]',
+                                                                   'cls']]
+        # 填充可能预测缺失的类别
+        self.logger.debug(f'conf > {self.score_threshold} num is {len(thresh_pred)}')
+        self._set_metric_matrix(thresh_pred, gt)
         pred = pred.sort_values(by=['score'], ascending=[False], ignore_index=True)
-        ap = np.zeros(self.class_num)
-        mean_ap = 0
-        if not thresh_pred.empty:
-            self.logger.debug(f'conf > {self.score_threshold} num is {len(thresh_pred)}')
-            self._set_metric_matrix(thresh_pred, gt)
-            y_truth = pred['cls'].copy()
-            y_truth[pred['fp']] = -1
-            ap = calc_ap(pred['cls'], y_truth, self.metric_matrix['TP+FN'], self.class_num)
-            self.metric_matrix['Ap'] = ap
-            mean_ap = np.mean(ap)
-            self.logger.info(f'\n{self.metric_matrix.to_string()}')
-            self.logger.info(f'\nmean ap is {mean_ap:.4f}')
+        y_truth = pred['cls'].copy()
+        y_truth[pred['fp']] = -1
+        ap = calc_ap(pred['cls'], y_truth, self.metric_matrix['TP+FN'], self.class_num)
+        mean_ap = np.mean(ap)
+        self.metric_matrix['Ap'] = ap
+        self.logger.info(f'\n{self.metric_matrix.to_string()}')
+        self.logger.info(f'\nmean ap is {mean_ap:.4f}')
         self._reset_data()
+        ap = {name: accu for name, accu in zip(self.class_name, ap)}
         return mean_ap, ap
 
     def print(self):

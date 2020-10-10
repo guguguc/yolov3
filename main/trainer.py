@@ -8,13 +8,16 @@ import tqdm
 
 from collections import OrderedDict
 from pathlib import Path
+
+from tensorflow import keras
 from terminaltables import SingleTable
 from termcolor import colored
 
 from main.dataloader.dataset import DataSet
 from main.logger import timer
 from main.evaluater import Evaluater
-from utils.misc import *
+from utils.misc import get_optimizer
+from utils.bbox import nms_gpu_v2
 from utils.util import copy_files, write_file
 
 
@@ -43,15 +46,15 @@ class Trainer:
         self.metric_names = []
         self.metrics = {}
         self.class_names = None
-        self.logger = logging.getLogger(__name__)
         self.tf_logger = None
         self.dataset = None
         self.ckpt_manager = None
         self.evaluater = None
         self.is_frozen = False
-        self.frozen_layers_exclude = ['conv_17', 'conv_20']
-        self.frezen_epoch = 30
+        self.frozen_layers_exclude = ['conv_015', 'conv_022']
+        self.frezen_epoch = 15
         self.first_eval = True
+        self.logger = logging.getLogger(__name__)
         self.init_dataset(data_params)
         self.init_evaluater()
         self.init_metrics()
@@ -61,7 +64,7 @@ class Trainer:
             initial_learning_rate=self.lr_init,
             decay_steps=self.epoches * self.step_per_epoch - self.warmup_steps,
             alpha=1e-6)
-        tf.config.run_functions_eagerly(True)
+        # tf.config.run_functions_eagerly(False)
 
     def frozen(self):
         for layer in self.net.backbone.layers:
@@ -211,8 +214,11 @@ class Trainer:
             lr = self.optimizer_schedule(
                 tf.math.subtract(self.global_count, self.warmup_steps))
         lr = tf.cast(lr, tf.float32)
-        self.optimizer.lr.assign(lr)
-        self.logger.debug(f'lr is {lr:.4f}')
+        self.optimizer.learning_rate = lr
+        with self.tf_logger['train'].as_default():
+            tf.summary.scalar(name='learning rate',
+                              data=lr,
+                              step=self.global_count)
 
     @tf.function(input_signature=[tf.TensorSpec([16, 416, 416, 3], tf.float32),
                                   tf.TensorSpec([16, None, 5], tf.float32)])
@@ -220,12 +226,15 @@ class Trainer:
         with tf.GradientTape() as tape:
             losses = self.net.forward(img, label, training=True)
             total_loss = tf.math.reduce_sum(losses)
-        grads = tape.gradient(total_loss, self.net.backbone.trainable_variables)
+        # grads = tape.gradient(total_loss, self.net.backbone.trainable_variables)
         # tf.print(self.net.backbone.get_layer('conv_001').variables[3])
-        self.optimizer.apply_gradients(zip(grads, self.net.backbone.trainable_variables))
+        # self.optimizer.apply_gradients(zip(grads, self.net.backbone.trainable_variables))
+        self.optimizer.minimize(total_loss,
+                                self.net.backbone.trainable_variables,
+                                tape=tape)
         self.update_metrics(losses, mode='train')
         self.write_logger(step=self.global_count, mode='train')
-        self.global_count.assign_add(1)
+        # self.global_count.assign_add(1)
 
     @tf.function(input_signature=[tf.TensorSpec([16, 416, 416, 3], tf.float32),
                                   tf.TensorSpec([16, None, 5], tf.float32)])
@@ -237,7 +246,7 @@ class Trainer:
 
     @tf.function
     def eval_step(self, img):
-        return self.net.predict(img)
+        return self.net(img)
 
     def train(self):
         self.logger.info(
@@ -264,19 +273,25 @@ class Trainer:
             )
             self.logger.info(f'checkpoint saved in {save_path}')
             # 验证
-            if tf.math.mod(epoch, 2) == 0:
-                self.test()
+            # self.test()
             # 评估MAP
             mean_ap, ap = self.eval()
+            with self.tf_logger['val'].as_default():
+                for name, accu in ap.items():
+                    tf.summary.scalar(name='class ' + name,
+                                      data=accu,
+                                      step=self.global_epoch)
+                tf.summary.scalar('mAP', mean_ap, self.global_epoch)
             if mean_ap > best_map:
                 best_map = mean_ap
                 best_path = os.path.join(self.checkpoint_path, 'best')
                 pattern = save_path + '*'
                 copy_files(pattern, best_path)
                 write_file(os.path.join(best_path, 'best'), str(best_map))
-                self.logger.info(f'[*] best map is {best_map}')
+                self.logger.info(f'best map is {best_map:.4f}')
             # 输出loss信息
             self.show_metric()
+            # self.net.debug()
 
     def test(self):
         self.logger.info('start to valid val dataset')
@@ -291,6 +306,8 @@ class Trainer:
     def eval(self):
         val_set = self.dataset['train']
         evaluator = self.evaluater
+        self.logger.info(f'iou thresh {evaluator.iou_threshold}')
+        self.logger.info(f'score thresh {evaluator.score_threshold}')
         self.logger.info('start to eval map')
         bar = tqdm.tqdm(val_set, total=self.step_per_epoch)
         t1 = time.perf_counter()
@@ -300,11 +317,17 @@ class Trainer:
             valid_gt_indices = tf.math.bincount(
                 tf.cast(tf.where(label_mask), tf.int32)[..., 0])
             gt_boxes, gt_cls = tf.split(label, [4, 1], axis=-1)
-            nms_boxes, nms_score, nms_cls, valid_nms_indices = self.eval_step(img)
+            pred = self.eval_step(img)
+            nms_info, val_index = nms_gpu_v2(pred,
+                                             iou_threshold=evaluator.iou_threshold,
+                                             score_threshold=5e-3,
+                                             max_size_total=5000)
+            pred_box, pred_score, pred_cls = tf.split(nms_info,
+                                                      [4, 1, 1],
+                                                      axis=-1)
             if self.first_eval:
                 evaluator.update_gt(gt_boxes, gt_cls, valid_gt_indices, img_id)
-            evaluator.update_pred(nms_boxes, nms_cls, nms_score,
-                                  valid_nms_indices, img_id)
+            evaluator.update_pred(pred_box, pred_cls, pred_score, val_index, img_id)
         t2 = time.perf_counter()
         internal = int(t2 - t1) * 1000
         step_internal = internal // self.step_per_epoch
@@ -313,3 +336,19 @@ class Trainer:
         mean_ap, ap = evaluator.eval()
         self.first_eval = False
         return mean_ap, ap
+
+    def profile(self):
+        dataset = iter(self.dataset['val'])
+        step = 80
+        tf.profiler.experimental.start(logdir='logs/profile')
+        for i in range(step):
+            if 30 <= i < 40:
+                with tf.profiler.experimental.Trace('train', step_num=i, _r=1):
+                    img, _, label = next(dataset)
+                    self.train_step(img, label)
+            elif i < 30:
+                img, _, label = next(dataset)
+                self.train_step(img, label)
+            else:
+                tf.profiler.experimental.stop()
+                break

@@ -23,14 +23,13 @@ def build_model(model_params: list) -> (keras.Model, list):
         model_params.pop(0) for item in model_params[:]
         if item['type'] not in LAYER
     ]
-    inputs = keras.Input(shape=(416, 416, 3), dtype=tf.float32, batch_size=16)
+    inputs = keras.Input(shape=(416, 416, 3), dtype=tf.float32)
     layer_list = []
     outs = []
     y = None
     first_dense = False
     msg = ''
     yolo_index = 1
-    #yolo_head = []
     yolo_losses = []
     logger.info('start to build net')
     for idx, layer_param in enumerate(model_params):
@@ -76,11 +75,12 @@ def build_model(model_params: list) -> (keras.Model, list):
             grid_size = y.shape[1]
             layer_param.update(name=f'yolo_{idx}', grid_size=grid_size)
             l1 = parse_yolo(layer_param)
-            l2 = YoloHead(anchors=l1.match_anchors, name=f'yolo-{yolo_index}')
+            l2 = YoloHead(anchors=l1.match_anchors,
+                          grid_size=grid_size,
+                          name=f'yolo-{yolo_index}')
             # add the previous layer to the final out
             outs.append(l2(y))
             yolo_losses.append(l1)
-            #yolo_head.append(l2)
             yolo_index += 1
 
         elif layer_type == 'shortcut':
@@ -107,8 +107,7 @@ def build_model(model_params: list) -> (keras.Model, list):
             msg += f' route use {groups} group, group id is {group_id}\n'
 
         elif layer_type == 'upsample':
-            l = keras.layers.UpSampling2D(size=layer_param['stride'],
-                                          interpolation='bilinear')
+            l = keras.layers.UpSampling2D(size=layer_param['stride'])
             y = l(y)
 
         else:

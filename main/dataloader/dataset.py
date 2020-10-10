@@ -1,8 +1,4 @@
-import cv2 as cv
-
-from main.logger import timer
 from main.dataloader.tf_example_decoder import TfExampleDecoder
-from utils.parser import Parser, ConfigParser
 from utils.tfconfig import enable_mem_group
 from utils.preprocess import *
 from utils.util import *
@@ -15,9 +11,9 @@ class Transformer:
     def __init__(self, params, mode):
         self.out_size = params.get('output_size', (416, 416))
         self.max_level = params.get('max_level', 5)
-        self.aug_random_flip = params.get('random_filp', True)
+        self.aug_random_flip = params.get('random_filp', False)
         self.aug_scale_min = params.get('scale_min', 1.0)
-        self.aug_scale_max = params.get('scale_max', 1.5)
+        self.aug_scale_max = params.get('scale_max', 1.0)
         self.max_num_instance = params.get('max_num_instance', 100)
         self.mode = mode
         self.is_training = mode == 'train'
@@ -47,7 +43,7 @@ class Transformer:
         # tf.print((t2-t1)*1000.0)
         gt_boxes = denormlize_boxes(gt_boxes, height, width)
         img, img_info = resize_and_crop_image(img, self.out_size,
-                                              caculate_padded_size(self.out_size, 2 ** self.max_level),
+                                              self.out_size,
                                               self.aug_scale_min, self.aug_scale_max)
         # resize and crop boxes
         padding = img_info[0, :]
@@ -82,7 +78,7 @@ class Transformer:
         return img, img_id, label
 
     def parse_predict_data(self, data):
-        pass
+        return data
 
 
 class DataSet:
@@ -91,7 +87,7 @@ class DataSet:
                  tf_record_path: str,
                  mode: str,
                  params: dict,
-                 shuffle_buffer=256):
+                 shuffle_buffer=512):
         self.batch_size = batch_size
         self.is_training = mode == 'train'
         self.imgs_num = 1000
@@ -108,12 +104,13 @@ class DataSet:
         dataset = tf.data.Dataset.list_files(self.file_pattern)
         dataset = dataset.interleave(
             map_func=self.data_fn, cycle_length=2,
-            num_parallel_calls=tf.data.experimental.AUTOTUNE,
-            deterministic=False
+            num_parallel_calls=2,
+            deterministic=True
         )
-        dataset = dataset.map(self.parse_fn, num_parallel_calls=12)
-        if self.is_training:
-            dataset = dataset.shuffle(self.shuffle_buffer)
+        dataset = dataset.map(self.parse_fn,
+                              num_parallel_calls=tf.data.experimental.AUTOTUNE)
+        # if self.is_training:
+        #    dataset = dataset.shuffle(self.shuffle_buffer)
         padded_shapes = ([None, None, 3], [], [None, 5])
         padded_values = (0., "", 0.)
 

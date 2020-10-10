@@ -6,6 +6,15 @@ from tqdm import tqdm
 from pathlib import Path
 
 
+def adjust_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
+    hsv = tf.image.rgb_to_hsv(img)
+    hyp = [hgain, sgain, vgain]
+    r = tf.random.uniform([3], -1, 1) * hyp + 1
+    hsv = tf.clip_by_value(hsv * r, 0., 1.)
+    img = tf.image.hsv_to_rgb(hsv)
+    return img
+
+
 def flip_left_right_boxes(boxes):
     """水平反转边界框
     :param boxes: Tensor of shape [None, 4]
@@ -18,7 +27,7 @@ def flip_left_right_boxes(boxes):
 
 
 def random_horizontal_filp(img, boxes):
-    do_flip = tf.greater(tf.random.uniform([], 0, 1, dtype=tf.float32), 0.5)
+    do_flip = tf.greater(tf.random.uniform([]), 0.5)
     img = tf.cond(pred=do_flip,
                   true_fn=lambda: img,
                   false_fn=lambda: tf.image.flip_left_right(img))
@@ -50,12 +59,12 @@ def resize_and_crop_image(img,
                           padding_size,
                           aug_scale_min=1.0,
                           aug_scale_max=1.0,
-                          seed=1,
+                          seed=None,
                           method=tf.image.ResizeMethod.BILINEAR):
     img_shape = tf.cast(tf.shape(img)[:2], tf.float32)
     random_jiter = (aug_scale_min != 1.0 or aug_scale_max != 1.0)
     if random_jiter:
-        random_scale = tf.random.uniform([], aug_scale_min, aug_scale_max, seed=seed)
+        random_scale = tf.random.uniform([], aug_scale_min, aug_scale_max)
         # tf.print(f'random size is {random_scale}')
         scale_size = tf.round(random_scale * desired_size)
     else:
@@ -78,8 +87,7 @@ def resize_and_crop_image(img,
     scaled_img = tf.image.resize(img, tf.cast(scale_size, tf.int32), method=method)
 
     if random_jiter:
-        scaled_img = scaled_img[offset[0]: offset[0] + desired_size[0],
-                     offset[1]: offset[1] + desired_size[1], :]
+        scaled_img = scaled_img[offset[0]: offset[0] + desired_size[0], offset[1]: offset[1] + desired_size[1], :]
 
     scale_size = tf.cast(scale_size, tf.float32)
     padding_height = tf.maximum(tf.cast(tf.floor((desired_size[0] - scale_size[0]) / 2), tf.int32), 0)

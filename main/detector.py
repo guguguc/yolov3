@@ -3,9 +3,9 @@ import logging
 
 import numpy as np
 import tensorflow as tf
+from terminaltables import AsciiTable
 
 from utils.module import build_model
-from utils.bbox import nms_gpu_v2
 from config.config import *
 
 DEBUG = False
@@ -15,32 +15,27 @@ if DEBUG:
     debugging('logs/debugging')
 
 
-class Detector:
+class Detector(tf.keras.Model):
     def __init__(self,
                  net_params,
                  weight=None,
                  cut_off=None):
+        super().__init__()
         self.backbone, self.yolo_losses = build_model(net_params)
         self.num_head = len(self.yolo_losses)
         self.logger = logging.getLogger(__name__)
+        if weight:
+            self.load_weight(weight, cut_off)
 
-        self.load_weight(weight, cut_off)
-
-    def predict(self, img):
+    def call(self, img, **kwargs):
         outputs = self.backbone(img, training=False)
-        # tf.print(self.backbone.get_layer('conv_001').variables[3])
-        shape = [BATCH_SIZE, -1, 4 + 1 + CLASS_NUM]
+        batch_size = tf.shape(outputs[0])[0]
+        shape = (batch_size, -1, 4 + 1 + CLASS_NUM)
         outputs = [tf.reshape(out, shape) for out in outputs]
         outputs = tf.concat(outputs, axis=1)
-        nms_info, val_indices = nms_gpu_v2(outputs,
-                                           iou_threshold=NMS_THRESH,
-                                           score_threshold=SCORE_THRESH,
-                                           max_size_total=MAX_DET_SIZE)
-        nms_boxes, nms_score, nms_cls = tf.split(nms_info, [4, 1, 1],
-                                                 axis=-1)
-        return nms_boxes, nms_score, nms_cls, val_indices
+        return outputs
 
-    def forward(self, img, label, training=True):
+    def forward(self, img, label, training=None):
         # t1 = time.perf_counter()
         outputs = self.backbone(img, training=training)
         # t2 = time.perf_counter()
@@ -50,7 +45,7 @@ class Detector:
             # t1 = time.perf_counter()
             lbox, lobj, lnoobj, lcls = loss_func(out, label)
             # t2 = time.perf_counter()
-            # print(f'loss forward cost {int((t2-t1)*1000)} ms')
+            # tf.print(f'loss forward cost {int((t2-t1)*1000)} ms')
             loss_box += lbox
             loss_obj += lobj
             loss_noobj += lnoobj
@@ -80,11 +75,14 @@ class Detector:
         self.logger.debug(f'read increnment: {current_read - previous_read},total read {current_read} bytes '
                           f'{current_read / (1 << 10):.2f} KB')
         previous_read = current_read
-        layer_list = [layer.name for layer in self.backbone.layers[1:] if layer.name[:4] == 'conv']
+        layer_list = [layer.name for layer in self.backbone.layers if layer.name[:4] == 'conv']
         layer_list.sort()
         if cut_off:
-            cut_off_index = layer_list.index(f'conv_{cut_off:03d}')
-            layer_list = layer_list[:cut_off_index]
+            if isinstance(cut_off, int):
+                cut_off_index = layer_list.index(f'conv_{cut_off:03d}')
+                layer_list = layer_list[:cut_off_index]
+            if isinstance(cut_off, list):
+                layer_list = [name for name in layer_list if name not in cut_off]
         info_msg = ''
         for idx, layer_name in enumerate(layer_list):
             layer = self.backbone.get_layer(layer_name)
@@ -115,6 +113,22 @@ class Detector:
             self.logger.debug(f'read increnment: {fp.tell() - previous_read},total read {fp.tell()} bytes ' +
                               f'{fp.tell() / (1 << 20):.2f} MB')
             previous_read = fp.tell()
-        assert len(fp.read()) == 0, 'falied to load weight'
+        # assert len(fp.read()) == 0, 'falied to load weight'
         self.logger.info(info_msg[5:])
         fp.close()
+
+    def get_config(self):
+        pass
+
+    def debug(self):
+        metrics = self.yolo_losses[0].metrics
+        metrics_list = [loss.get_metric() for loss in self.yolo_losses]
+        cols = [[m] for m in metrics]
+        for i, var in enumerate(metrics_list):
+            for j, m in enumerate(metrics):
+                cols[j].append(f'{var[m]:.3f}')
+        table = AsciiTable(table_data=cols)
+        print('\n' + table.table)
+        for loss in self.yolo_losses:
+            loss.reset_metric()
+
