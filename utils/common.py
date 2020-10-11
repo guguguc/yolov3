@@ -244,37 +244,6 @@ class YOLOLoss:
             self.metrics_dict[m] /= num
         return self.metrics_dict
 
-    def bbox_giou(self, boxes1, boxes2):
-
-        boxes1 = tf.concat([boxes1[..., :2] - boxes1[..., 2:] * 0.5,
-                            boxes1[..., :2] + boxes1[..., 2:] * 0.5], axis=-1)
-        boxes2 = tf.concat([boxes2[..., :2] - boxes2[..., 2:] * 0.5,
-                            boxes2[..., :2] + boxes2[..., 2:] * 0.5], axis=-1)
-
-        boxes1 = tf.concat([tf.minimum(boxes1[..., :2], boxes1[..., 2:]),
-                            tf.maximum(boxes1[..., :2], boxes1[..., 2:])], axis=-1)
-        boxes2 = tf.concat([tf.minimum(boxes2[..., :2], boxes2[..., 2:]),
-                            tf.maximum(boxes2[..., :2], boxes2[..., 2:])], axis=-1)
-
-        boxes1_area = (boxes1[..., 2] - boxes1[..., 0]) * (boxes1[..., 3] - boxes1[..., 1])
-        boxes2_area = (boxes2[..., 2] - boxes2[..., 0]) * (boxes2[..., 3] - boxes2[..., 1])
-
-        left_up = tf.maximum(boxes1[..., :2], boxes2[..., :2])
-        right_down = tf.minimum(boxes1[..., 2:], boxes2[..., 2:])
-
-        inter_section = tf.maximum(right_down - left_up, 0.0)
-        inter_area = inter_section[..., 0] * inter_section[..., 1]
-        union_area = boxes1_area + boxes2_area - inter_area
-        iou = inter_area / union_area
-
-        enclose_left_up = tf.minimum(boxes1[..., :2], boxes2[..., :2])
-        enclose_right_down = tf.maximum(boxes1[..., 2:], boxes2[..., 2:])
-        enclose = tf.maximum(enclose_right_down - enclose_left_up, 0.0)
-        enclose_area = enclose[..., 0] * enclose[..., 1]
-        giou = iou - 1.0 * (enclose_area - union_area) / enclose_area
-
-        return giou
-
     def decode_gt_box(self, box, indices):
         # 相对于一个网格的偏移(0-1)
         anchors = tf.gather(self.match_anchors, indices[..., 2])
@@ -318,30 +287,27 @@ class YOLOLoss:
                                                       y_true=tf.zeros_like(neg_obj))
         loss_cls = self.sparse_loss(y_pred=val_pred_cls, y_true=cls_mask)
         loss_box_scale = 2.0 - box[..., 2] * box[..., 3]
-        # loss_xy = loss_box_scale * self.mse_loss(y_pred=pos_xy, y_true=truth_xy)
-        # loss_wh = loss_box_scale * self.mse_loss(y_pred=pos_wh, y_true=truth_wh)
-        giou = self.bbox_giou(tf.boolean_mask(pred_box, obj_mask), box)
-        giou = tf.expand_dims(giou, axis=-1)
-        loss_box = loss_box_scale * (1 - giou) * self.iou_normalizer
+        loss_xy = loss_box_scale * self.mse_loss(y_pred=pos_xy, y_true=truth_xy)
+        loss_wh = loss_box_scale * self.mse_loss(y_pred=pos_wh, y_true=truth_wh)
 
         # show info
-        total_count = tf.cast(tf.reduce_prod(tf.shape(pred_conf)), tf.float32)
-        obj_count = tf.cast(obj_count, tf.float32)
-        noobj_count = tf.cast(noobj_count, tf.float32)
-        ignore_count = total_count - obj_count - noobj_count
-        truth_pred_box = tf.boolean_mask(pred_box, obj_mask)
-        cls_accu_mask = tf.argmax(val_pred_cls, -1, tf.int32) == cls_mask
-        iou = calc_iou_vectorition_xywh(truth_pred_box, box)
-        cls_accu = tf.reduce_mean(tf.cast(cls_accu_mask, tf.float32)) * 100.
-        mean_iou = tf.reduce_mean(iou)
+        # total_count = tf.cast(tf.reduce_prod(tf.shape(pred_conf)), tf.float32)
+        # obj_count = tf.cast(obj_count, tf.float32)
+        # noobj_count = tf.cast(noobj_count, tf.float32)
+        # ignore_count = total_count - obj_count - noobj_count
+        # truth_pred_box = tf.boolean_mask(pred_box, obj_mask)
+        # cls_accu_mask = tf.argmax(val_pred_cls, -1, tf.int32) == cls_mask
+        # iou = calc_iou_vectorition_xywh(truth_pred_box, box)
+        # cls_accu = tf.reduce_mean(tf.cast(cls_accu_mask, tf.float32)) * 100.
+        # mean_iou = tf.reduce_mean(iou)
 
         batch_size = tf.cast(tf.shape(y_pred)[0], tf.float32)
         loss_obj = tf.reduce_sum(loss_obj) / batch_size
         loss_noobj = tf.reduce_sum(loss_noobj) / batch_size
         loss_cls = tf.reduce_sum(loss_cls) / batch_size
-        # loss_wh = tf.reduce_sum(loss_wh) / batch_size
-        # loss_xy = tf.reduce_sum(loss_xy) / batch_size
-        # loss_box = (loss_wh + loss_xy)
+        loss_wh = tf.reduce_sum(loss_wh) / batch_size
+        loss_xy = tf.reduce_sum(loss_xy) / batch_size
+        loss_box = (loss_wh + loss_xy)
         loss_box = tf.reduce_sum(loss_box) / batch_size
         # self.update_metric(loss_box,
         #                    loss_obj, loss_noobj, loss_cls,
