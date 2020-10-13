@@ -1,8 +1,7 @@
-from main.dataloader.tf_example_decoder import TfExampleDecoder
-from utils.tfconfig import enable_mem_group
-from utils.preprocess import *
+from main.dataloader.decoder import TfExampleDecoder
+from utils.bbox import yxyx2xywh, normlize_boxes, denormlize_boxes, resize_and_crop_boxes, caculate_padded_size
+from utils.image import *
 from utils.util import *
-from utils.bbox import yxyx2xywh
 
 enable_mem_group()
 
@@ -23,8 +22,6 @@ class Transformer:
             self.parse_fn = self.parse_train_data
         elif mode == 'val':
             self.parse_fn = self.parse_eval_data
-        elif mode == 'predict':
-            self.parse_fn = self.parse_predict_data
 
     def __call__(self, value):
         with tf.name_scope('data_transform'):
@@ -76,9 +73,6 @@ class Transformer:
         gt_classes = tf.reshape(gt_classes, [-1, 1])
         label = tf.concat([gt_boxes, gt_classes], axis=-1)
         return img, img_id, label
-
-    def parse_predict_data(self, data):
-        return data
 
 
 class DataSet:

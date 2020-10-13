@@ -1,5 +1,5 @@
 import re
-import numpy as np
+
 import tensorflow as tf
 
 
@@ -45,18 +45,3 @@ def contor_pairing(pair):
     k3 = pair[:, 0]
     k = tf.math.floordiv(k1 * k2, 2) + k3
     return k
-
-
-def auc_n_point_interpolation(x, y, n=101):
-    # 求离散曲线下面积
-    # 假定x属于[0,1]
-    # 从[0-1]选择等距的n个点
-    # auc_area = sum((1/(n-1)) * max(y_{i * 1/(n-1)}, y_{xmax})
-    segment = np.linspace(0, 1, n)
-    auc_area = 0
-    for p in segment:
-        mask = x >= p
-        if mask.any():
-            auc_area += np.max(y[mask])
-    auc_area /= n
-    return auc_area

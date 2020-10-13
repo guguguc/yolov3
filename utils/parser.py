@@ -1,7 +1,8 @@
-from utils.blas import isfloat, isint, isseq
-from utils.util import check_file_exist
-from utils.common import YOLOLoss
 from collections import OrderedDict
+
+from utils.blas import isfloat, isint, isseq
+from utils.layer import YOLOLoss
+from utils.util import check_file_exist
 
 
 class Parser:

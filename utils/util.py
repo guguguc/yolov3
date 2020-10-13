@@ -1,10 +1,9 @@
 import glob
 import os
 import shutil
+
 import numpy as np
 import tensorflow as tf
-
-from utils.blas import contor_pairing_n, auc_n_point_interpolation
 
 
 def check_file_exist(file_path):
@@ -20,9 +19,11 @@ def copy_files(src, dst):
     for file in files:
         shutil.copy2(file, dst)
 
+
 def write_file(src, content):
     with open(src, mode='w+') as fp:
         fp.write(content)
+
 
 def calc_receive_fild(net_params: list):
     previous_receivr_filed = 0
@@ -86,3 +87,30 @@ def calc_ap(y_pred, y_truth, gt_classs_num, num_class):
         recall = tp_accum / gt_classs_num[cls]
         ap[cls] = auc_n_point_interpolation(recall, precision)
     return ap
+
+
+def auc_n_point_interpolation(x, y, n=101):
+    # 求离散曲线下面积
+    # 假定x属于[0,1]
+    # 从[0-1]选择等距的n个点
+    # auc_area = sum((1/(n-1)) * max(y_{i * 1/(n-1)}, y_{xmax})
+    segment = np.linspace(0, 1, n)
+    auc_area = 0
+    for p in segment:
+        mask = x >= p
+        if mask.any():
+            auc_area += np.max(y[mask])
+    auc_area /= n
+    return auc_area
+
+
+def enable_mem_group():
+    gpu = tf.config.list_physical_devices('GPU')[0]
+    tf.config.experimental.set_memory_growth(gpu, True)
+
+
+def debugging(root_path):
+    tf.debugging.experimental.enable_dump_debug_info(
+        dump_root=root_path,
+        tensor_debug_mode='FULL_HEALTH',
+        circular_buffer_size=-1)

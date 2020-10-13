@@ -1,6 +1,6 @@
-import cv2 as cv
 import matplotlib.pyplot as plt
-from utils.preprocess import *
+
+from utils.image import *
 
 fig, axes = plt.subplots(2, 2)
 filename = 'data/sample/demo.jpg'
