@@ -1,2 +1,2 @@
-# YOLOv3 implemention in TensorFlow 2
+# YOLOv3 implementation in TensorFlow 2
 YOLO object detector.
